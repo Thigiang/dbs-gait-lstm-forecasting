@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# data and large outputs
+*.mat
+*.h5
+*.npy
+train_data.pkl
+val_data.pkl
+test_data.pkl
+results/
+
+# virtual environment
+.venv/
+
+# local data and machine-specific settings
+data/
+DATA/
+.env
+*.log
+
+# not published
+UCSF_Presentation.pdf
