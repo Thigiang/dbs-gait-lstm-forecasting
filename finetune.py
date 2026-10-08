@@ -133,12 +133,7 @@ def main():
 
     print(f"\nBest val MAE {best_score:.5f}. Saved to {best_path}")
     print(f"Train with it:  python train.py --model {args.model} --hyperparams {best_path}")
-    print("or paste into the settings block of train.py:")
-    print(f"LSTM_UNITS = {best['lstm_units']}")
-    print(f"DENSE_UNITS = {best['dense_units']}")
-    print(f"L2_REG = {best['l2_reg']:.3g}")
-    print(f"LEARNING_RATE = {best['learning_rate']:.3g}")
-    print(f"BATCH_SIZE = {best['batch_size']}")
+    print(f"or paste into BEST_SETTINGS in train.py:\n    \"{args.model}\": {best},")
 
 
 if __name__ == "__main__":

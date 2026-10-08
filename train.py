@@ -3,13 +3,15 @@ train.py -- train and evaluate a model that forecasts Left Channel 1 band powers
 
 Each model reads INPUT_WIDTH timesteps of the DBS settings and the predicted band powers (by default the 5 Left
 Channel 1 bands, Delta to Gamma; see PREDICTED_FEATURES in dataset.py) and predicts the next LABEL_WIDTH timesteps
-of those band powers. Both models use the same data (dataset.py) and the same training settings, so their test
-MAEs can be compared directly.
+of those band powers. Both models use the same data (dataset.py) and are tested on the same windows, so their test
+MAEs can be compared directly, also with the simple baselines in baselines.py.
 
     --model feedback   FeedBack: warms up on the input window, then predicts one step at a time, feeding each
                        prediction back in as the next input (closed loop, INPUT_WIDTH + LABEL_WIDTH - 1 LSTM steps).
-    --model direct     DirectLSTM: the same 2-layer LSTM reads the input window, then a Dense head predicts all
-                       LABEL_WIDTH steps at once (INPUT_WIDTH LSTM steps; about 2.5x faster per epoch).
+    --model direct     DirectLSTM: the same kind of 2-layer LSTM reads the input window, then a Dense head predicts
+                       all LABEL_WIDTH steps at once (INPUT_WIDTH LSTM steps, so it trains much faster).
+
+Each model uses its own BEST_SETTINGS (model sizes, learning rate, batch size) found with finetune.py.
 
 Training is safe to interrupt: progress is backed up after every epoch, and running the same command again
 resumes where it stopped. The best weights so far and a per-epoch CSV log are written throughout training.
@@ -47,14 +49,14 @@ SHIFT = 400             # offset from the end of the input window to the end of 
 STRIDE = 5              # train/validation windows start every STRIDE timesteps (1 would give near-duplicate windows)
 VAL_RATIO, TEST_RATIO = 0.2, 0.2   # chronological split of each session's gait cycles
 
-## Model (from a search on an earlier data setup; rerun finetune.py to tune for this one)
-LSTM_UNITS = 414
-DENSE_UNITS = 37
-L2_REG = 2e-05
-
-## Training
-LEARNING_RATE = 7.9e-05
-BATCH_SIZE = 128
+## Model and training: the settings chosen with finetune.py for each model (override with --hyperparams)
+BEST_SETTINGS = {
+    ## best of 15 trials (val MAE 0.0521 after 20 epochs)
+    "feedback": {'lstm_units': 512, 'dense_units': 50, 'l2_reg': 2.233566487900397e-06,
+                 'learning_rate': 5.810967383502568e-05, 'batch_size': 32},
+    ## runner-up of 30 trials (val MAE 0.0503); the best trial (512 units, 0.0501) is no better on test, at 13x the size
+    "direct": {'lstm_units': 32, 'dense_units': 128, 'l2_reg': 1e-06, 'learning_rate': 0.001, 'batch_size': 32},
+}
 SHUFFLE = True          # each batch mixes windows from different gait cycles
 SEED = 42
 
@@ -67,14 +69,13 @@ def parse_args():
     parser.add_argument("--patience", type = int, default = 20, help = "early-stopping patience in epochs (default: 20)")
     parser.add_argument("--hyperparams", metavar = "JSON",
                         help = "best-setting file from finetune.py (<model>_best_hyperparams.json); "
-                               "overrides the model sizes, L2_REG, LEARNING_RATE and BATCH_SIZE above")
+                               "overrides the model's BEST_SETTINGS above")
     return parser.parse_args()
 
 
 def load_hyperparams(path, model_type):
-    """Return the tunable settings: the settings block above, overridden by a finetune.py result file if given."""
-    hyperparams = {'lstm_units': LSTM_UNITS, 'dense_units': DENSE_UNITS, 'l2_reg': L2_REG,
-                   'learning_rate': LEARNING_RATE, 'batch_size': BATCH_SIZE}
+    """Return the model's tunable settings: BEST_SETTINGS above, overridden by a finetune.py result file if given."""
+    hyperparams = dict(BEST_SETTINGS[model_type])
     if path:
         with open(path) as file:
             tuned = json.load(file)
@@ -84,7 +85,7 @@ def load_hyperparams(path, model_type):
     return hyperparams
 
 
-def build_model(model_type, sample_input, lstm_units = LSTM_UNITS, dense_units = DENSE_UNITS, l2_reg = L2_REG):
+def build_model(model_type, sample_input, lstm_units, dense_units, l2_reg):
     """Create the model and build its weights on one input window (BackupAndRestore needs a built model)."""
     num_outputs = len(PREDICTED_FEATURES)
     if model_type == "feedback":
@@ -186,8 +187,8 @@ def main():
 
     hp = load_hyperparams(args.hyperparams, args.model)
     print(f"Settings: {hp}")
-    run_name = (f"{args.model}_{INPUT_WIDTH}to{LABEL_WIDTH}_stride{STRIDE}_bs{hp['batch_size']}_lr{hp['learning_rate']:.3g}"
-                + (f"_u{hp['lstm_units']}_tuned" if args.hyperparams else ""))
+    run_name = (f"{args.model}_{INPUT_WIDTH}to{LABEL_WIDTH}_stride{STRIDE}_u{hp['lstm_units']}"
+                f"_bs{hp['batch_size']}_lr{hp['learning_rate']:.3g}")
     model = build_model(args.model, data.X_train[:1], hp['lstm_units'], hp['dense_units'], hp['l2_reg'])
     history = train(model, data, run_name, args.epochs, args.patience, hp['learning_rate'], hp['batch_size'])
 
