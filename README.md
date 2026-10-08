@@ -81,6 +81,7 @@ The presentation showed the training curve, predictions vs. labels and MAE per t
 |---|---|
 | [train.py](train.py) | **Main script.** Trains and evaluates FeedBack or DirectLSTM, then saves weights, history, test predictions and plots |
 | [finetune.py](finetune.py) | Bayesian hyperparameter search (`scikit-optimize`) on the same data and settings as `train.py` |
+| [baselines.py](baselines.py) | Simple non-learned forecasts (last value, average gait cycle) that the models are compared against |
 | [eda.py](eda.py) | Data summary: gait cycles per split, cycle lengths, column ranges, DBS settings per session, window shapes, and two plots |
 | [dataset.py](dataset.py) | Column definitions and the shared data pipeline (load → split → normalize → windows) |
 | [modelutils.py](modelutils.py) | The `FeedBack` and `DirectLSTM` models, plus `ModelUtils` (compile & fit, window building, plotting) |
@@ -131,13 +132,20 @@ Run the scripts from inside this folder.
 # 1. look at the data
 python eda.py
 
-# 2. (optional) search for hyperparameters; prints a settings block to paste into train.py
-python finetune.py --model feedback --trials 30
+# 2. score simple baselines (seconds, no training)
+python baselines.py
 
-# 3. train and evaluate a model
-python train.py --model feedback
+# 3. (optional) search for the best hyperparameters of each model -> <model>_best_hyperparams.json
+python finetune.py --model direct
+python finetune.py --model feedback --trials 15 --trial-epochs 20
+
+# 4. train and evaluate a model, with the settings in train.py ...
 python train.py --model direct
+# ... or with the best settings found in step 3
+python train.py --model direct --hyperparams "$FEEDBACK_RESULTS_DIR/direct_best_hyperparams.json"
 ```
+
+`finetune.py` options: `--trials` (default 30), `--trial-epochs` (maximum epochs per trial, default 50), `--patience` (default 5) and `--fresh`. An interrupted search resumes from its finished trials when run again; `--fresh` starts over (use it after changing the data or settings).
 
 `train.py` options: `--epochs` (default 300) and `--patience` (early-stopping patience, default 20). The other settings (window sizes, model sizes, learning rate, batch size) are in the settings block at the top of the file.
 
@@ -150,7 +158,7 @@ python train.py --model direct
 | `FEEDBACK_RESULTS_DIR` | best weights (`.weights.h5`), per-epoch log (`_log.csv`), full history and test predictions (`.pkl`) |
 | `FEEDBACK_IMAGES_DIR` | loss curves, and one prediction plot per band for a test example |
 
-At the end of training, `train.py` prints the test MAE overall (normalized units) and per band (original units).
+At the end of training, `train.py` prints a table comparing the model with the baselines from `baselines.py`: test MAE overall (normalized units) and per band (original units).
 
 ---
 

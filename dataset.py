@@ -52,6 +52,12 @@ class PreparedData:
         n = len(CONSTANT_FEATURES)
         return y * self.range[n:] + self.mean[n:]
 
+    def test_mae(self, prediction):
+        """Score test predictions: MAE over everything (normalized units) and per band (original units)."""
+        overall = float(np.mean(np.abs(prediction - self.y_test)))
+        per_band = np.mean(np.abs(self.denormalize_outputs(prediction) - self.denormalize_outputs(self.y_test)), axis = (0, 1))
+        return overall, dict(zip(PREDICTED_FEATURES, per_band))
+
 
 def load_sessions(data_dir, features = INPUT_FEATURES):
     """Return {file name: list of gait cycles}, each cycle a (timesteps, len(features)) array."""

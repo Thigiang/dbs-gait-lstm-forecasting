@@ -12,10 +12,13 @@ Each trial trains a fresh model with early stopping and is scored by its best va
 without the L2 penalty, so trials with different l2_reg are compared fairly). Trials are short (--trial-epochs)
 to keep the search affordable; train the chosen setting fully with train.py afterwards.
 
+The search is safe to interrupt: running the same command again resumes from the finished trials (--fresh starts
+over; use it after changing the data or settings in dataset.py / train.py).
+
 Outputs, in the results folder:
     <model>_search_trials.csv          one row per finished trial, written as the search goes
     <model>_best_hyperparams.json      the best setting, written at the end
-The best setting is also printed in the form of train.py's settings block, ready to paste.
+Train the best setting with  python train.py --model <model> --hyperparams <results folder>/<model>_best_hyperparams.json
 
 Run:
     python finetune.py --model feedback
@@ -51,6 +54,8 @@ def parse_args():
     parser.add_argument("--trials", type = int, default = 30, help = "number of settings to try (default: 30)")
     parser.add_argument("--trial-epochs", type = int, default = 50, help = "maximum epochs per trial (default: 50)")
     parser.add_argument("--patience", type = int, default = 5, help = "early-stopping patience per trial (default: 5)")
+    parser.add_argument("--fresh", action = "store_true",
+                        help = "discard the trials of an earlier search for this model instead of resuming it")
     return parser.parse_args()
 
 
@@ -69,6 +74,17 @@ def run_trial(model_type, data, params, epochs, patience):
     return score, len(val_mae)
 
 
+def read_previous_trials(path, param_names):
+    """Return (settings, scores) of the trials already in the CSV, typed to match SEARCH_SPACE."""
+    if not os.path.exists(path):
+        return [], []
+    casts = {dim.name: float if isinstance(dim, Real) else int for dim in SEARCH_SPACE}
+    with open(path) as file:
+        rows = list(csv.DictReader(file))
+    settings = [[casts[name](row[name]) for name in param_names] for row in rows]
+    return settings, [float(row["best_val_mae"]) for row in rows]
+
+
 def main():
     args = parse_args()
     os.makedirs(path_to_save_models_results, exist_ok = True)
@@ -80,10 +96,16 @@ def main():
                                  train.VAL_RATIO, train.TEST_RATIO)
     print(f"Train: {data.X_train.shape}, Validation: {data.X_val.shape}")
 
-    with open(trials_path, "w", newline = "") as file:
-        csv.writer(file).writerow(["trial"] + param_names + ["best_val_mae", "epochs_run"])
+    ## Resume an interrupted search: earlier trials are passed to the optimizer instead of being rerun
+    previous_x, previous_y = ([], []) if args.fresh else read_previous_trials(trials_path, param_names)
+    if not previous_x:
+        with open(trials_path, "w", newline = "") as file:
+            csv.writer(file).writerow(["trial"] + param_names + ["best_val_mae", "epochs_run"])
+    else:
+        print(f"Resuming: {len(previous_x)} trials already in {trials_path} (use --fresh to start over)")
+    remaining = args.trials - len(previous_x)
 
-    trial_count = [0]
+    trial_count = [len(previous_x)]
 
     @use_named_args(SEARCH_SPACE)
     def objective(**params):
@@ -96,15 +118,22 @@ def main():
             csv.writer(file).writerow([trial_count[0]] + [params[name] for name in param_names] + [score, epochs_run])
         return score
 
-    result = gp_minimize(objective, SEARCH_SPACE, n_calls = args.trials,
-                         n_initial_points = min(10, args.trials), random_state = train.SEED)
+    if remaining > 0:
+        result = gp_minimize(objective, SEARCH_SPACE, n_calls = remaining,
+                             n_initial_points = max(0, min(10, args.trials) - len(previous_x)),
+                             x0 = previous_x or None, y0 = previous_y or None, random_state = train.SEED)
+        best_x, best_score = result.x, result.fun
+    else:
+        best_i = int(np.argmin(previous_y))
+        best_x, best_score = previous_x[best_i], previous_y[best_i]
 
-    best = {name: value.item() if hasattr(value, "item") else value for name, value in zip(param_names, result.x)}
+    best = {name: value.item() if hasattr(value, "item") else value for name, value in zip(param_names, best_x)}
     with open(best_path, "w") as file:
-        json.dump({"model": args.model, "best_val_mae": float(result.fun), **best}, file, indent = 2)
+        json.dump({"model": args.model, "best_val_mae": float(best_score), **best}, file, indent = 2)
 
-    print(f"\nBest val MAE {result.fun:.5f}. Saved to {best_path}")
-    print("Paste into the settings block of train.py:")
+    print(f"\nBest val MAE {best_score:.5f}. Saved to {best_path}")
+    print(f"Train with it:  python train.py --model {args.model} --hyperparams {best_path}")
+    print("or paste into the settings block of train.py:")
     print(f"LSTM_UNITS = {best['lstm_units']}")
     print(f"DENSE_UNITS = {best['dense_units']}")
     print(f"L2_REG = {best['l2_reg']:.3g}")

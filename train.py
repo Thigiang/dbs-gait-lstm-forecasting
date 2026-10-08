@@ -21,11 +21,13 @@ Outputs (named <model>_<settings>_*):
 Run:
     python train.py --model feedback
     python train.py --model direct --epochs 100 --patience 10
+    python train.py --model direct --hyperparams <results folder>/direct_best_hyperparams.json
 Paths come from configs.py (environment variables FEEDBACK_DATA_DIR, FEEDBACK_RESULTS_DIR, FEEDBACK_IMAGES_DIR).
 TensorFlow uses an Apple-silicon GPU automatically when the tensorflow-metal plugin is installed.
 """
 import os
 import csv
+import json
 import time
 import pickle
 import argparse
@@ -33,7 +35,8 @@ import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from configs import path_to_data, path_to_save_models_results, path_to_save_models_images
-from dataset import load_and_prepare_data, CONSTANT_FEATURES, PREDICTED_FEATURES, INPUT_FEATURES
+from dataset import load_sessions, load_and_prepare_data, CONSTANT_FEATURES, PREDICTED_FEATURES, INPUT_FEATURES
+from baselines import baseline_predictions, print_comparison
 from modelutils import FeedBack, DirectLSTM, ModelUtils
 
 ## ---------------- settings ----------------
@@ -62,7 +65,23 @@ def parse_args():
                         help = "feedback: closed-loop FeedBack LSTM; direct: DirectLSTM (all steps at once)")
     parser.add_argument("--epochs", type = int, default = 300, help = "maximum number of epochs (default: 300)")
     parser.add_argument("--patience", type = int, default = 20, help = "early-stopping patience in epochs (default: 20)")
+    parser.add_argument("--hyperparams", metavar = "JSON",
+                        help = "best-setting file from finetune.py (<model>_best_hyperparams.json); "
+                               "overrides the model sizes, L2_REG, LEARNING_RATE and BATCH_SIZE above")
     return parser.parse_args()
+
+
+def load_hyperparams(path, model_type):
+    """Return the tunable settings: the settings block above, overridden by a finetune.py result file if given."""
+    hyperparams = {'lstm_units': LSTM_UNITS, 'dense_units': DENSE_UNITS, 'l2_reg': L2_REG,
+                   'learning_rate': LEARNING_RATE, 'batch_size': BATCH_SIZE}
+    if path:
+        with open(path) as file:
+            tuned = json.load(file)
+        if tuned.get('model') != model_type:
+            raise SystemExit(f"{path} was tuned for --model {tuned.get('model')}, not --model {model_type}")
+        hyperparams.update({key: tuned[key] for key in hyperparams})
+    return hyperparams
 
 
 def build_model(model_type, sample_input, lstm_units = LSTM_UNITS, dense_units = DENSE_UNITS, l2_reg = L2_REG):
@@ -88,7 +107,7 @@ def read_log(path):
     return {key: [float(row[key]) for row in rows] for key in rows[0]} if rows else {}
 
 
-def train(model, data, run_name, epochs, patience):
+def train(model, data, run_name, epochs, patience, learning_rate, batch_size):
     """
     Fit with early stopping, backing up after every epoch so an interrupted run resumes.
     Leaves the model holding the best weights of the whole run and returns the full per-epoch history.
@@ -112,7 +131,7 @@ def train(model, data, run_name, epochs, patience):
 
     start_time = time.time()
     history = ModelUtils.compile_and_fit(model, (data.X_train, data.y_train), (data.X_val, data.y_val),
-                                         (LEARNING_RATE, epochs), patience = patience, batch_size = BATCH_SIZE,
+                                         (learning_rate, epochs), patience = patience, batch_size = batch_size,
                                          shuffle = SHUFFLE, use_early_stopping = True, extra_callbacks = callbacks)
     training_time = time.time() - start_time
     num_epochs_run = len(history.history['loss'])
@@ -126,9 +145,7 @@ def train(model, data, run_name, epochs, patience):
 def evaluate(model, data):
     """Predict the test windows; return predictions and MAE overall (normalized) and per band (original units)."""
     prediction = model(data.X_test).numpy()
-    test_mae = np.mean(np.abs(prediction - data.y_test))
-    band_mae = np.mean(np.abs(data.denormalize_outputs(prediction) - data.denormalize_outputs(data.y_test)), axis = (0, 1))
-    return prediction, test_mae, dict(zip(PREDICTED_FEATURES, band_mae))
+    return (prediction, *data.test_mae(prediction))
 
 
 def save_results(run_name, history, prediction, data):
@@ -160,21 +177,28 @@ def main():
     os.makedirs(path_to_save_models_images, exist_ok = True)
     print(f"Devices: {[device.name for device in tf.config.list_physical_devices()]}")
 
-    data = load_and_prepare_data(path_to_data, INPUT_WIDTH, LABEL_WIDTH, SHIFT, STRIDE, VAL_RATIO, TEST_RATIO)
+    sessions = load_sessions(path_to_data)
+    data = load_and_prepare_data(path_to_data, INPUT_WIDTH, LABEL_WIDTH, SHIFT, STRIDE, VAL_RATIO, TEST_RATIO,
+                                 sessions = sessions)
     print(f"Train: {data.X_train.shape} -> {data.y_train.shape}")
     print(f"Validation: {data.X_val.shape} -> {data.y_val.shape}")
     print(f"Test: {data.X_test.shape} -> {data.y_test.shape}")
 
-    run_name = f"{args.model}_{INPUT_WIDTH}to{LABEL_WIDTH}_stride{STRIDE}_bs{BATCH_SIZE}_lr{LEARNING_RATE}"
-    model = build_model(args.model, data.X_train[:1])
-    history = train(model, data, run_name, args.epochs, args.patience)
+    hp = load_hyperparams(args.hyperparams, args.model)
+    print(f"Settings: {hp}")
+    run_name = (f"{args.model}_{INPUT_WIDTH}to{LABEL_WIDTH}_stride{STRIDE}_bs{hp['batch_size']}_lr{hp['learning_rate']:.3g}"
+                + (f"_u{hp['lstm_units']}_tuned" if args.hyperparams else ""))
+    model = build_model(args.model, data.X_train[:1], hp['lstm_units'], hp['dense_units'], hp['l2_reg'])
+    history = train(model, data, run_name, args.epochs, args.patience, hp['learning_rate'], hp['batch_size'])
 
     prediction, test_mae, band_mae = evaluate(model, data)
-    print(f"Test MAE (normalized): {test_mae:.5f}")
     print(f"Best val MAE (normalized): {min(history['val_mean_absolute_error']):.5f}")  # val_loss also includes the L2 penalty
-    print("Test MAE per band (original units):")
-    for band, mae in band_mae.items():
-        print(f"    {band:<10} {mae:.5g}")
+
+    ## Compare with simple non-learned forecasts on the same test windows (see baselines.py)
+    baselines = baseline_predictions(sessions, data, INPUT_WIDTH, LABEL_WIDTH, SHIFT, VAL_RATIO, TEST_RATIO)
+    scores = {name: data.test_mae(baseline) for name, baseline in baselines.items()}
+    scores[f"{args.model} model"] = (test_mae, band_mae)
+    print_comparison(scores)
 
     save_results(run_name, history, prediction, data)
 
